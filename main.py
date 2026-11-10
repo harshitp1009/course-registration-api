@@ -1,6 +1,10 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from bs4 import BeautifulSoup
 import re
+from collections import defaultdict
+from decimal import Decimal, InvalidOperation
+
+from bs4 import BeautifulSoup
+from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
+from pydantic import BaseModel
 
 app = FastAPI()
 
@@ -9,8 +13,8 @@ courses = {}
 
 
 def normalize_course_code(code):
-    """Convert codes like 'COSC 3506' and 'COSC3506' to 'COSC3506'."""
-    return re.sub(r"\s+", "", code).upper()
+    """Convert codes like 'COSC 3506' and 'COSC-3506' to 'COSC3506'."""
+    return re.sub(r"[\s-]+", "", code).upper()
 
 
 def extract_course_codes(text):
@@ -19,7 +23,7 @@ def extract_course_codes(text):
         return []
 
     # Matches codes such as COSC 2006, ITEC 3506, ABCD 1234
-    matches = re.findall(r"\b[A-Za-z]{2,}\s*\d{3,4}[A-Za-z]?\b", text)
+    matches = re.findall(r"\b[A-Za-z]{2,}[\s-]*\d{3,4}[A-Za-z]?\b", text)
 
     return [normalize_course_code(code) for code in matches]
 
@@ -79,7 +83,7 @@ async def import_catalog(file: UploadFile = File(...)):
             "title": title,
             "credits": credits,
             "prerequisites": extract_course_codes(prerequisites_text),
-            "cross_listed": extract_course_codes(cross_listed_text)
+            "cross_listed": extract_course_codes(cross_listed_text),
         }
 
         courses[course_code] = course
@@ -88,10 +92,7 @@ async def import_catalog(file: UploadFile = File(...)):
     if imported == 0:
         raise HTTPException(status_code=400, detail="No courses found")
 
-    return {
-        "message": "Catalog imported successfully",
-        "courses_imported": imported
-    }
+    return {"message": "Catalog imported successfully", "courses_imported": imported}
 
 
 @app.get("/api/v1/catalog/courses/{course_code}")
@@ -103,12 +104,9 @@ def get_course(course_code: str):
 
     return courses[normalized_code]
 
+
 # Phase 2: each student has an independent history and future plan.
 # In-memory state is cleared when the service restarts; use one server worker.
-from decimal import Decimal, InvalidOperation
-from fastapi import Depends
-from pydantic import BaseModel
-
 app.state.students = {}
 
 
@@ -160,8 +158,9 @@ def parse_transcript(content):
 
     for table in soup.find_all("table"):
         # Ignore rows belonging to nested tables when examining this table.
-        rows = [row for row in table.find_all("tr")
-                if row.find_parent("table") is table]
+        rows = [
+            row for row in table.find_all("tr") if row.find_parent("table") is table
+        ]
         columns = None
         for row in rows:
             cells = row.find_all(["th", "td"], recursive=False)
@@ -185,12 +184,15 @@ def parse_transcript(content):
             priority = (grade_priority(values[columns["grade"]]), credits)
             key = (course_code, term)
             if key not in selected or priority > selected[key][0]:
-                selected[key] = (priority, {
-                    "course_code": course_code,
-                    "term": term,
-                    "credits_earned": credits,
-                    "status": status,
-                })
+                selected[key] = (
+                    priority,
+                    {
+                        "course_code": course_code,
+                        "term": term,
+                        "credits_earned": credits,
+                        "status": status,
+                    },
+                )
 
     if not found_table:
         raise HTTPException(status_code=400, detail="No transcript tables found")
@@ -214,7 +216,9 @@ async def import_history(student_id: str, file: UploadFile = File(...)):
 
 
 @app.put("/api/v1/students/{student_id}/history")
-async def update_history(body: HistoryUpdate, student: dict = Depends(existing_student)):
+async def update_history(
+    body: HistoryUpdate, student: dict = Depends(existing_student)
+):
     student["history"] = [course.model_dump() for course in body.history]
     return {"status": "success", "message": "Academic history updated successfully"}
 
@@ -243,4 +247,105 @@ async def delete_plan(student: dict = Depends(existing_student)):
 
 @app.get("/api/v1/students/{student_id}/profile")
 async def get_profile(student_id: str, student: dict = Depends(existing_student)):
-    return {"student_id": student_id, "history": student["history"], "plan": student["plan"]}
+    return {
+        "student_id": student_id,
+        "history": student["history"],
+        "plan": student["plan"],
+    }
+
+
+SEASON_ORDER = {"W": 0, "SP": 1, "S": 2, "F": 3}
+GRADUATION_CREDITS = 120
+UNKNOWN_TERM = (100, 0)
+
+
+def term_key(term):
+    match = re.fullmatch(r"([0-9]{2})(W|SP|S|F)", term.strip().upper())
+    if match is None:
+        return UNKNOWN_TERM
+    year, season = match.groups()
+    return int(year), SEASON_ORDER[season]
+
+
+def display_course_code(code):
+    return re.sub(r"^([A-Z]+)([0-9])", r"\1-\2", code)
+
+
+@app.get("/api/v1/students/{student_id}/audit-report")
+async def audit_report(
+    student_id: str, strict: bool = False, student: dict = Depends(existing_student)
+):
+    first_completion = {}
+    latest_credit = {}
+    for attempt in student["history"]:
+        if attempt["status"] != "Completed":
+            continue
+        code = normalize_course_code(attempt["course_code"])
+        when = term_key(attempt["term"])
+        first_completion[code] = min(when, first_completion.get(code, UNKNOWN_TERM))
+        # Prefer the latest completed attempt, using the higher credits to break ties.
+        credit = (when != UNKNOWN_TERM, when, attempt["credits_earned"])
+        latest_credit[code] = max(credit, latest_credit.get(code, credit))
+
+    cross_listed = defaultdict(set)
+    for code, course in courses.items():
+        for alias in course["cross_listed"]:
+            if alias != code:
+                cross_listed[code].add(alias)
+                cross_listed[alias].add(code)
+
+    errors_by_term = defaultdict(list)
+    cross_list_violations = []
+    total_planned = 0
+    for planned in student["plan"]:
+        course_code = planned["course_code"]
+        code = normalize_course_code(course_code)
+        term = planned["term"]
+        when = term_key(term)
+        course = courses.get(code, {})
+        credits = course.get("credits", 0)
+        if isinstance(credits, (int, float)):
+            total_planned += credits
+
+        for prerequisite in dict.fromkeys(course.get("prerequisites", [])):
+            completed = first_completion.get(prerequisite, UNKNOWN_TERM)
+            if when == UNKNOWN_TERM or completed >= when:
+                errors_by_term[term].append(
+                    {
+                        "course_code": course_code,
+                        "type": "MISSING_PREREQUISITE",
+                        "message": f"Missing prerequisite: {display_course_code(prerequisite)}",
+                    }
+                )
+
+        for alias in sorted(cross_listed[code].intersection(first_completion)):
+            cross_list_violations.append(
+                {
+                    "course_code": course_code,
+                    "type": "CROSS_LIST_CONFLICT",
+                    "message": f"Cross-listed with completed course {display_course_code(alias)}",
+                }
+            )
+
+    timeline = [
+        {"term": term, "errors": errors_by_term[term]}
+        for term in sorted(errors_by_term, key=term_key)
+    ]
+    total_earned = sum(credits for _, _, credits in latest_credit.values())
+    status = "ok"
+    if timeline or cross_list_violations:
+        status = "failed" if strict else "warning"
+
+    return {
+        "student_id": student_id,
+        "status": status,
+        "timeline_validation": timeline,
+        "cross_list_violations": cross_list_violations,
+        "credit_summary": {
+            "total_earned": total_earned,
+            "total_planned": total_planned,
+            "total_remaining_for_graduation": max(
+                0, GRADUATION_CREDITS - total_earned - total_planned
+            ),
+        },
+    }
